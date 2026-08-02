@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+"""在线图片工具 — single-file standalone.
+
+Requires: pip install flask pillow rembg
+Usage:
+  python3 jpg-standalone.py                    # dev mode (reads static/ from disk)
+  python3 jpg-standalone.py --port 9000        # custom port
+  python3 jpg-standalone.py --host 0.0.0.0    # bind to all interfaces
+  python3 jpg-standalone.py --no-browser       # don't open browser
+
+Build standalone (no static/ needed):
+  python3 build-standalone.py                  # generates ./jpg
+"""
+
+import argparse
+import io
+import os
+import sys
+import tempfile
+import uuid
+import webbrowser
+from pathlib import Path
+
+from flask import Flask, jsonify, request, send_file, abort, Response
+
+from image_engine import (
+    load_image,
+    image_to_bytes,
+    process_resize,
+    process_convert,
+    process_white_bg,
+    process_id_photo,
+    get_image_info,
+    ID_PHOTO_SIZES,
+    RESIZE_PRESETS,
+    OUTPUT_FORMATS,
+    AVAILABLE_MODELS,
+    DEFAULT_MODEL,
+)
+
+APP_DIR = Path(__file__).parent / "static"
+
+# ── Embedded static assets ─────────────────────────────────────────────────
+# Populated at startup: either from memory (build) or from disk (dev).
+_STATIC = {}  # { "index.html": ("text/html; charset=utf-8", bytes), ... }
+
+
+def _load_static():
+    """Load static files from embedded data (or fallback to disk)."""
+    global _STATIC
+    # Built-in embedded assets (auto-generated)
+    _STATIC = {
+        "index.html": ("text/html; charset=utf-8", b'<!DOCTYPE html>\n<html lang="zh-CN">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width, initial-scale=1.0">\n<title>\xf0\x9f\x96\xbc\xef\xb8\x8f \xe5\x9c\xa8\xe7\xba\xbf\xe5\x9b\xbe\xe7\x89\x87\xe5\xb7\xa5\xe5\x85\xb7</title>\n<link rel="stylesheet" href="/style.css">\n</head>\n<body>\n\n<!-- Toolbar -->\n<div id="toolbar">\n  <span id="toolbar-title">\xf0\x9f\x96\xbc\xef\xb8\x8f \xe5\x9c\xa8\xe7\xba\xbf\xe5\x9b\xbe\xe7\x89\x87\xe5\xb7\xa5\xe5\x85\xb7</span>\n  <div id="toolbar-actions">\n    <span id="file-name-display" style="opacity:0.7;font-size:13px;">\xe6\x9c\xaa\xe9\x80\x89\xe6\x8b\xa9\xe5\x9b\xbe\xe7\x89\x87</span>\n  </div>\n</div>\n\n<!-- Sidebar -->\n<div id="sidebar">\n  <div id="sidebar-tabs">\n    <button class="sidebar-tab active" data-tab="resize">\xf0\x9f\x93\x90 \xe8\xb0\x83\xe6\x95\xb4\xe5\xb0\xba\xe5\xaf\xb8</button>\n    <button class="sidebar-tab" data-tab="convert">\xf0\x9f\x94\x84 \xe6\xa0\xbc\xe5\xbc\x8f\xe8\xbd\xac\xe6\x8d\xa2</button>\n    <button class="sidebar-tab" data-tab="white-bg">\xe2\xac\x9c \xe7\x99\xbd\xe5\xba\x95\xe7\x85\xa7\xe7\x89\x87</button>\n  </div>\n\n  <!-- Resize Panel -->\n  <div id="panel-resize" class="sidebar-panel active">\n    <div class="panel-content">\n      <div class="field-group">\n        <label>\xe9\xa2\x84\xe8\xae\xbe\xe5\xb0\xba\xe5\xaf\xb8</label>\n        <select id="resize-preset">\n          <option value="">\xe8\x87\xaa\xe5\xae\x9a\xe4\xb9\x89...</option>\n        </select>\n      </div>\n\n      <div class="field-group">\n        <label>\xe5\xae\xbd\xe5\xba\xa6 (\xe5\x83\x8f\xe7\xb4\xa0)</label>\n        <input type="number" id="resize-width" min="1" max="8000" placeholder="\xe8\x87\xaa\xe5\x8a\xa8">\n      </div>\n\n      <div class="field-group">\n        <label>\xe9\xab\x98\xe5\xba\xa6 (\xe5\x83\x8f\xe7\xb4\xa0)</label>\n        <input type="number" id="resize-height" min="1" max="8000" placeholder="\xe8\x87\xaa\xe5\x8a\xa8">\n      </div>\n\n      <div class="field-group">\n        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">\n          <input type="checkbox" id="resize-keep-aspect" checked>\n          \xe4\xbf\x9d\xe6\x8c\x81\xe5\xae\xbd\xe9\xab\x98\xe6\xaf\x94\n        </label>\n      </div>\n\n      <div class="field-group">\n        <label>\xe6\x8c\x89\xe7\x99\xbe\xe5\x88\x86\xe6\xaf\x94\xe7\xbc\xa9\xe6\x94\xbe</label>\n        <div style="display:flex;gap:8px;align-items:center;">\n          <input type="range" id="resize-percentage" min="10" max="500" value="100" style="flex:1;">\n          <span id="resize-percentage-label" style="min-width:45px;text-align:right;">100%</span>\n        </div>\n      </div>\n\n      <button class="btn-primary" id="btn-resize">\xf0\x9f\x93\x90 \xe8\xb0\x83\xe6\x95\xb4\xe5\xb0\xba\xe5\xaf\xb8</button>\n    </div>\n  </div>\n\n  <!-- Convert Panel -->\n  <div id="panel-convert" class="sidebar-panel">\n    <div class="panel-content">\n      <div class="field-group">\n        <label>\xe7\x9b\xae\xe6\xa0\x87\xe6\xa0\xbc\xe5\xbc\x8f</label>\n        <div class="format-options" id="format-options">\n          <label class="format-option selected" data-format="JPEG">\n            <span class="format-icon">\xf0\x9f\x96\xbc\xef\xb8\x8f</span>\n            <span class="format-name">JPEG</span>\n            <span class="format-desc">\xe6\x9c\x89\xe6\x8d\x9f\xe5\x8e\x8b\xe7\xbc\xa9\xc2\xb7\xe4\xbd\x93\xe7\xa7\xaf\xe5\xb0\x8f</span>\n          </label>\n          <label class="format-option" data-format="PNG">\n            <span class="format-icon">\xf0\x9f\x96\xbc\xef\xb8\x8f</span>\n            <span class="format-name">PNG</span>\n            <span class="format-desc">\xe6\x97\xa0\xe6\x8d\x9f\xc2\xb7\xe6\x94\xaf\xe6\x8c\x81\xe9\x80\x8f\xe6\x98\x8e</span>\n          </label>\n          <label class="format-option" data-format="WebP">\n            <span class="format-icon">\xf0\x9f\x96\xbc\xef\xb8\x8f</span>\n            <span class="format-name">WebP</span>\n            <span class="format-desc">\xe7\x8e\xb0\xe4\xbb\xa3\xe6\xa0\xbc\xe5\xbc\x8f\xc2\xb7\xe4\xbd\x93\xe7\xa7\xaf\xe5\xb0\x8f</span>\n          </label>\n          <label class="format-option" data-format="BMP">\n            <span class="format-icon">\xf0\x9f\x96\xbc\xef\xb8\x8f</span>\n            <span class="format-name">BMP</span>\n            <span class="format-desc">\xe4\xbd\x8d\xe5\x9b\xbe\xc2\xb7\xe6\x97\xa0\xe5\x8e\x8b\xe7\xbc\xa9</span>\n          </label>\n        </div>\n      </div>\n\n      <div class="field-group" id="quality-group">\n        <label>\xe8\xb4\xa8\xe9\x87\x8f</label>\n        <div style="display:flex;gap:8px;align-items:center;">\n          <input type="range" id="convert-quality" min="10" max="100" value="90" style="flex:1;">\n          <span id="convert-quality-label" style="min-width:40px;text-align:right;">90%</span>\n        </div>\n      </div>\n\n      <button class="btn-primary" id="btn-convert">\xf0\x9f\x94\x84 \xe8\xbd\xac\xe6\x8d\xa2\xe6\xa0\xbc\xe5\xbc\x8f</button>\n    </div>\n  </div>\n\n  <!-- White BG Panel -->\n  <div id="panel-white-bg" class="sidebar-panel">\n    <div class="panel-content">\n      <div class="info-callout">\n        \xf0\x9f\x92\xa1 \xe5\xb0\x86\xe5\x9b\xbe\xe7\x89\x87\xe7\x9a\x84\xe9\x80\x8f\xe6\x98\x8e\xe8\x83\x8c\xe6\x99\xaf\xe8\xbd\xac\xe6\x8d\xa2\xe4\xb8\xba\xe7\x99\xbd\xe8\x89\xb2\xe8\x83\x8c\xe6\x99\xaf\xe3\x80\x82\xe4\xbd\xbf\xe7\x94\xa8 AI \xe8\x87\xaa\xe5\x8a\xa8\xe8\xaf\x86\xe5\x88\xab\xe5\xb9\xb6\xe7\xa7\xbb\xe9\x99\xa4\xe8\x83\x8c\xe6\x99\xaf\xef\xbc\x8c\xe7\x94\x9f\xe6\x88\x90\xe7\x99\xbd\xe5\xba\x95 JPEG\xe3\x80\x82\n      </div>\n      <div class="field-group">\n        <label>AI \xe6\x8a\xa0\xe5\x9b\xbe\xe6\xa8\xa1\xe5\x9e\x8b</label>\n        <select id="white-bg-model">\n        </select>\n      </div>\n      <button class="btn-primary" id="btn-white-bg">\xe2\xac\x9c \xe7\x94\x9f\xe6\x88\x90\xe7\x99\xbd\xe5\xba\x95\xe7\x85\xa7\xe7\x89\x87</button>\n    </div>\n  </div>\n</div>\n\n<!-- Main area -->\n<div id="main-area">\n  <!-- Drop zone / empty state -->\n  <div id="drop-zone">\n    <div class="drop-zone-content">\n      <div class="drop-icon">\xf0\x9f\x93\xb7</div>\n      <div class="drop-text">\xe6\x8b\x96\xe6\x8b\xbd\xe5\x9b\xbe\xe7\x89\x87\xe5\x88\xb0\xe6\xad\xa4\xe5\xa4\x84\xef\xbc\x8c\xe6\x88\x96\xe7\x82\xb9\xe5\x87\xbb\xe9\x80\x89\xe6\x8b\xa9\xe6\x96\x87\xe4\xbb\xb6</div>\n      <div class="drop-hint">\xe6\x94\xaf\xe6\x8c\x81 JPG\xe3\x80\x81PNG\xe3\x80\x81WebP\xe3\x80\x81BMP\xe3\x80\x81GIF\xe3\x80\x81TIFF</div>\n      <input type="file" id="file-input" accept=".png,.jpg,.jpeg,.webp,.bmp,.gif,.tiff,.tif" style="display:none">\n      <button class="btn-outline" id="btn-select-file">\xf0\x9f\x93\x82 \xe9\x80\x89\xe6\x8b\xa9\xe5\x9b\xbe\xe7\x89\x87</button>\n    </div>\n  </div>\n\n  <!-- Preview area -->\n  <div id="preview-area" style="display:none;">\n    <div id="preview-toolbar">\n      <button id="btn-new-file">\xf0\x9f\x93\x82 \xe6\x96\xb0\xe5\x9b\xbe\xe7\x89\x87</button>\n      <div id="preview-info">\n        <span id="preview-filename"></span>\n        <span id="preview-dimensions"></span>\n        <span id="preview-size"></span>\n      </div>\n    </div>\n    <div id="preview-container">\n      <div id="preview-original">\n        <div class="preview-label">\xe5\x8e\x9f\xe5\x9b\xbe</div>\n        <div class="preview-img-wrap">\n          <img id="img-original" src="" alt="\xe5\x8e\x9f\xe5\xa7\x8b\xe5\x9b\xbe\xe7\x89\x87">\n        </div>\n        <div id="original-info" class="img-info"></div>\n      </div>\n      <div id="preview-arrow">\xe2\x9e\xa1\xef\xb8\x8f</div>\n      <div id="preview-result">\n        <div class="preview-label">\xe5\xa4\x84\xe7\x90\x86\xe7\xbb\x93\xe6\x9e\x9c</div>\n        <div class="preview-img-wrap">\n          <img id="img-result" src="" alt="\xe5\xa4\x84\xe7\x90\x86\xe7\xbb\x93\xe6\x9e\x9c">\n        </div>\n        <div id="result-info" class="img-info"></div>\n        <div id="result-actions" style="display:none;">\n          <button class="btn-primary" id="btn-download">\xf0\x9f\x92\xbe \xe4\xb8\x8b\xe8\xbd\xbd</button>\n        </div>\n      </div>\n    </div>\n  </div>\n</div>\n\n<!-- ID Photo panel (fixed bottom-right) -->\n<div id="id-photo-panel">\n  <div id="id-photo-header">\n    <span>\xf0\x9f\x93\xb8 \xe8\xaf\x81\xe4\xbb\xb6\xe7\x85\xa7\xe5\x88\xb6\xe4\xbd\x9c</span>\n    <button id="id-photo-toggle" title="\xe5\xb1\x95\xe5\xbc\x80/\xe6\x94\xb6\xe8\xb5\xb7">\xe2\x96\xbc</button>\n  </div>\n  <div id="id-photo-body">\n    <div class="field-group">\n      <label>\xe8\xaf\x81\xe4\xbb\xb6\xe7\x85\xa7\xe5\xb0\xba\xe5\xaf\xb8</label>\n      <select id="id-photo-size">\n      </select>\n    </div>\n    <div class="field-group">\n      <label>\xe8\x83\x8c\xe6\x99\xaf\xe9\xa2\x9c\xe8\x89\xb2</label>\n      <div class="bg-color-options">\n        <label class="bg-color-option selected" data-color="white">\n          <span class="color-swatch" style="background:#fff;border:2px solid #ccc;"></span> \xe7\x99\xbd\xe8\x89\xb2\n        </label>\n        <label class="bg-color-option" data-color="red">\n          <span class="color-swatch" style="background:#c8161e;"></span> \xe7\xba\xa2\xe8\x89\xb2\n        </label>\n        <label class="bg-color-option" data-color="blue">\n          <span class="color-swatch" style="background:#3c78d2;"></span> \xe8\x93\x9d\xe8\x89\xb2\n        </label>\n      </div>\n    </div>\n    <div class="field-group">\n      <label>AI \xe6\x8a\xa0\xe5\x9b\xbe\xe6\xa8\xa1\xe5\x9e\x8b</label>\n      <select id="id-photo-model">\n      </select>\n    </div>\n    <button class="btn-primary" id="btn-id-photo">\xf0\x9f\x93\xb8 \xe7\x94\x9f\xe6\x88\x90\xe8\xaf\x81\xe4\xbb\xb6\xe7\x85\xa7</button>\n  </div>\n</div>\n\n<!-- Status bar -->\n<div id="status-bar">\n  <span id="status-text">\xe5\xb0\xb1\xe7\xbb\xaa \xe2\x80\x94 \xe8\xaf\xb7\xe5\x85\x88\xe4\xb8\x8a\xe4\xbc\xa0\xe5\x9b\xbe\xe7\x89\x87</span>\n</div>\n\n<script src="/app.js"></script>\n</body>\n</html>\n'),
+        "app.js": ("application/javascript; charset=utf-8", b'/* === Online Image Tool \xe2\x80\x94 Frontend App === */\n(function () {\n  "use strict";\n\n  // --- State ---\n  const state = {\n    uploadId: null,\n    fileName: null,\n    originalInfo: null,\n    resultId: null,\n    resultInfo: null,\n    activeTab: "resize",\n    // Resize state\n    resizeWidth: null,\n    resizeHeight: null,\n    resizeKeepAspect: true,\n    resizePercentage: 100,\n    // Convert state\n    convertFormat: "JPEG",\n    convertQuality: 90,\n    // ID photo state\n    idPhotoSize: "1inch",\n    idPhotoBgColor: "white",\n    // Presets from server\n    resizePresets: {},\n    idPhotoPresets: {},\n    formats: {},\n  };\n\n  // --- DOM refs ---\n  const $ = (s) => document.querySelector(s);\n  const $$ = (s) => document.querySelectorAll(s);\n\n  const dom = {\n    dropZone: $("#drop-zone"),\n    fileInput: $("#file-input"),\n    previewArea: $("#preview-area"),\n    imgOriginal: $("#img-original"),\n    imgResult: $("#img-result"),\n    originalInfo: $("#original-info"),\n    resultInfo: $("#result-info"),\n    resultActions: $("#result-actions"),\n    btnDownload: $("#btn-download"),\n    previewFilename: $("#preview-filename"),\n    previewDimensions: $("#preview-dimensions"),\n    previewSize: $("#preview-size"),\n    statusText: $("#status-text"),\n    fileNameDisplay: $("#file-name-display"),\n    // Resize\n    resizePreset: $("#resize-preset"),\n    resizeWidth: $("#resize-width"),\n    resizeHeight: $("#resize-height"),\n    resizeKeepAspect: $("#resize-keep-aspect"),\n    resizePercentage: $("#resize-percentage"),\n    resizePercentageLabel: $("#resize-percentage-label"),\n    btnResize: $("#btn-resize"),\n    // Convert\n    formatOptions: $("#format-options"),\n    convertQuality: $("#convert-quality"),\n    convertQualityLabel: $("#convert-quality-label"),\n    qualityGroup: $("#quality-group"),\n    btnConvert: $("#btn-convert"),\n    // White BG\n    btnWhiteBg: $("#btn-white-bg"),\n    // ID Photo\n    idPhotoSize: $("#id-photo-size"),\n    idPhotoPanel: $("#id-photo-panel"),\n    btnIdPhoto: $("#btn-id-photo"),\n    // Models\n    whiteBgModel: $("#white-bg-model"),\n    idPhotoModel: $("#id-photo-model"),\n  };\n\n  // --- Helpers ---\n  function formatBytes(bytes) {\n    if (bytes < 1024) return bytes + " B";\n    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";\n    return (bytes / (1024 * 1024)).toFixed(2) + " MB";\n  }\n\n  function showToast(msg, type) {\n    type = type || "";\n    const el = document.createElement("div");\n    el.className = "toast " + type;\n    el.textContent = msg;\n    document.body.appendChild(el);\n    setTimeout(() => el.remove(), 3000);\n  }\n\n  function setStatus(msg) {\n    dom.statusText.textContent = msg;\n  }\n\n  function setProcessing(btn, active) {\n    if (active) {\n      btn.disabled = true;\n      btn.dataset.origText = btn.textContent;\n      btn.textContent = "\xe2\x8f\xb3 \xe5\xa4\x84\xe7\x90\x86\xe4\xb8\xad...";\n    } else {\n      btn.disabled = false;\n      btn.textContent = btn.dataset.origText || btn.textContent;\n    }\n  }\n\n  // --- API ---\n  async function api(url, opts) {\n    if (opts === undefined) opts = {};\n    try {\n      const res = await fetch(url, opts);\n      if (!res.ok) {\n        const err = await res.json().catch(() => ({}));\n        throw new Error(err.detail || "HTTP " + res.status);\n      }\n      const ct = res.headers.get("content-type") || "";\n      if (ct.includes("image/")) {\n        const blob = await res.blob();\n        return { _blob: blob, _mime: ct.split(";")[0] };\n      }\n      return res.json();\n    } catch (e) {\n      console.error("API error:", e);\n      showToast(e.message, "error");\n      throw e;\n    }\n  }\n\n  // --- Upload ---\n  async function uploadFile(file) {\n    setStatus("\xe6\xad\xa3\xe5\x9c\xa8\xe4\xb8\x8a\xe4\xbc\xa0 " + file.name + "...");\n    const formData = new FormData();\n    formData.append("file", file);\n    try {\n      const data = await api("/api/upload", { method: "POST", body: formData });\n      state.uploadId = data.id;\n      state.fileName = data.name;\n      state.originalInfo = data.info;\n      state.resultId = null;\n      state.resultInfo = null;\n\n      // Load preview\n      dom.imgOriginal.src = "/api/preview/" + state.uploadId + "?t=" + Date.now();\n      dom.imgResult.src = "";\n      dom.resultActions.style.display = "none";\n\n      // Update UI\n      dom.dropZone.style.display = "none";\n      dom.previewArea.style.display = "flex";\n      dom.fileNameDisplay.textContent = data.name;\n      dom.previewFilename.textContent = data.name;\n      dom.previewDimensions.textContent = data.info.width + " \xc3\x97 " + data.info.height;\n      dom.previewSize.textContent = formatBytes(data.info.file_size);\n      dom.originalInfo.textContent = data.info.format + " \xc2\xb7 " + data.info.mode + " \xc2\xb7 " + data.info.width + "\xc3\x97" + data.info.height;\n\n      // Populate resize inputs\n      dom.resizeWidth.value = data.info.width;\n      dom.resizeHeight.value = data.info.height;\n      state.resizeWidth = data.info.width;\n      state.resizeHeight = data.info.height;\n\n      setStatus("\xe5\xb7\xb2\xe5\x8a\xa0\xe8\xbd\xbd: " + data.name + " (" + data.info.width + "\xc3\x97" + data.info.height + ")");\n    } catch (e) {\n      setStatus("\xe4\xb8\x8a\xe4\xbc\xa0\xe5\xa4\xb1\xe8\xb4\xa5: " + e.message);\n    }\n  }\n\n  // --- Operations ---\n  async function doResize() {\n    if (!state.uploadId) { showToast("\xe8\xaf\xb7\xe5\x85\x88\xe4\xb8\x8a\xe4\xbc\xa0\xe5\x9b\xbe\xe7\x89\x87", "error"); return; }\n\n    const body = { upload_id: state.uploadId };\n    const pct = parseInt(dom.resizePercentage.value);\n\n    if (pct !== 100) {\n      body.percentage = pct;\n    } else {\n      const w = parseInt(dom.resizeWidth.value);\n      const h = parseInt(dom.resizeHeight.value);\n      if (w && w > 0) body.width = w;\n      if (h && h > 0) body.height = h;\n      body.keep_aspect = dom.resizeKeepAspect.checked;\n    }\n\n    setStatus("\xe6\xad\xa3\xe5\x9c\xa8\xe8\xb0\x83\xe6\x95\xb4\xe5\xb0\xba\xe5\xaf\xb8...");\n    try {\n      const data = await api("/api/resize", {\n        method: "POST",\n        headers: { "Content-Type": "application/json" },\n        body: JSON.stringify(body),\n      });\n\n      state.resultId = data.result_id;\n      state.resultInfo = data;\n      dom.imgResult.src = "/api/result/" + data.result_id + "?t=" + Date.now();\n      dom.resultInfo.textContent = data.width + "\xc3\x97" + data.height + " \xc2\xb7 " + formatBytes(data.size);\n      dom.resultActions.style.display = "block";\n      setStatus("\xe5\xb0\xba\xe5\xaf\xb8\xe8\xb0\x83\xe6\x95\xb4\xe5\xae\x8c\xe6\x88\x90: " + data.width + "\xc3\x97" + data.height + " (" + formatBytes(data.size) + ")");\n      showToast("\xe5\xb0\xba\xe5\xaf\xb8\xe8\xb0\x83\xe6\x95\xb4\xe5\xae\x8c\xe6\x88\x90", "success");\n    } catch (e) {\n      setStatus("\xe5\xa4\x84\xe7\x90\x86\xe5\xa4\xb1\xe8\xb4\xa5: " + e.message);\n    }\n  }\n\n  async function doConvert() {\n    if (!state.uploadId) { showToast("\xe8\xaf\xb7\xe5\x85\x88\xe4\xb8\x8a\xe4\xbc\xa0\xe5\x9b\xbe\xe7\x89\x87", "error"); return; }\n\n    const body = {\n      upload_id: state.uploadId,\n      format: state.convertFormat,\n      quality: parseInt(dom.convertQuality.value),\n    };\n\n    setStatus("\xe6\xad\xa3\xe5\x9c\xa8\xe8\xbd\xac\xe6\x8d\xa2\xe6\xa0\xbc\xe5\xbc\x8f...");\n    try {\n      const data = await api("/api/convert", {\n        method: "POST",\n        headers: { "Content-Type": "application/json" },\n        body: JSON.stringify(body),\n      });\n\n      state.resultId = data.result_id;\n      state.resultInfo = data;\n      dom.imgResult.src = "/api/result/" + data.result_id + "?t=" + Date.now();\n      dom.resultInfo.textContent = data.format + " \xc2\xb7 " + data.width + "\xc3\x97" + data.height + " \xc2\xb7 " + formatBytes(data.size);\n      dom.resultActions.style.display = "block";\n      setStatus("\xe6\xa0\xbc\xe5\xbc\x8f\xe8\xbd\xac\xe6\x8d\xa2\xe5\xae\x8c\xe6\x88\x90: " + data.format + " (" + formatBytes(data.size) + ")");\n      showToast("\xe6\xa0\xbc\xe5\xbc\x8f\xe8\xbd\xac\xe6\x8d\xa2\xe5\xae\x8c\xe6\x88\x90", "success");\n    } catch (e) {\n      setStatus("\xe8\xbd\xac\xe6\x8d\xa2\xe5\xa4\xb1\xe8\xb4\xa5: " + e.message);\n    }\n  }\n\n  async function doWhiteBg() {\n    if (!state.uploadId) { showToast("\xe8\xaf\xb7\xe5\x85\x88\xe4\xb8\x8a\xe4\xbc\xa0\xe5\x9b\xbe\xe7\x89\x87", "error"); return; }\n\n    setProcessing(dom.btnWhiteBg, true);\n    setStatus("\xe6\xad\xa3\xe5\x9c\xa8 AI \xe6\x8a\xa0\xe5\x9b\xbe + \xe7\x94\x9f\xe6\x88\x90\xe7\x99\xbd\xe5\xba\x95\xe7\x85\xa7\xe7\x89\x87...");\n    try {\n      const data = await api("/api/white-bg", {\n        method: "POST",\n        headers: { "Content-Type": "application/json" },\n        body: JSON.stringify({\n          upload_id: state.uploadId,\n          model: dom.whiteBgModel.value,\n        }),\n      });\n\n      state.resultId = data.result_id;\n      state.resultInfo = data;\n      dom.imgResult.src = "/api/result/" + data.result_id + "?t=" + Date.now();\n      dom.resultInfo.textContent = data.width + "\xc3\x97" + data.height + " \xc2\xb7 " + formatBytes(data.size);\n      dom.resultActions.style.display = "block";\n      setStatus("\xe7\x99\xbd\xe5\xba\x95\xe7\x85\xa7\xe7\x89\x87\xe7\x94\x9f\xe6\x88\x90\xe5\xae\x8c\xe6\x88\x90 (" + formatBytes(data.size) + ")");\n      showToast("\xe7\x99\xbd\xe5\xba\x95\xe7\x85\xa7\xe7\x89\x87\xe7\x94\x9f\xe6\x88\x90\xe5\xae\x8c\xe6\x88\x90", "success");\n    } catch (e) {\n      setStatus("\xe5\xa4\x84\xe7\x90\x86\xe5\xa4\xb1\xe8\xb4\xa5: " + e.message);\n    } finally {\n      setProcessing(dom.btnWhiteBg, false);\n    }\n  }\n\n  async function doIdPhoto() {\n    if (!state.uploadId) { showToast("\xe8\xaf\xb7\xe5\x85\x88\xe4\xb8\x8a\xe4\xbc\xa0\xe5\x9b\xbe\xe7\x89\x87", "error"); return; }\n\n    setProcessing(dom.btnIdPhoto, true);\n    const body = {\n      upload_id: state.uploadId,\n      size: state.idPhotoSize,\n      bg_color: state.idPhotoBgColor,\n      model: dom.idPhotoModel.value,\n    };\n\n    setStatus("\xe6\xad\xa3\xe5\x9c\xa8 AI \xe6\x8a\xa0\xe5\x9b\xbe + \xe7\x94\x9f\xe6\x88\x90\xe8\xaf\x81\xe4\xbb\xb6\xe7\x85\xa7...");\n    try {\n      const data = await api("/api/id-photo", {\n        method: "POST",\n        headers: { "Content-Type": "application/json" },\n        body: JSON.stringify(body),\n      });\n\n      state.resultId = data.result_id;\n      state.resultInfo = data;\n      dom.imgResult.src = "/api/result/" + data.result_id + "?t=" + Date.now();\n      dom.resultInfo.textContent = data.label + " \xc2\xb7 " + data.width + "\xc3\x97" + data.height + " \xc2\xb7 " + formatBytes(data.size);\n      dom.resultActions.style.display = "block";\n      setStatus("\xe8\xaf\x81\xe4\xbb\xb6\xe7\x85\xa7\xe7\x94\x9f\xe6\x88\x90\xe5\xae\x8c\xe6\x88\x90: " + data.label + " (" + formatBytes(data.size) + ")");\n      showToast("\xe8\xaf\x81\xe4\xbb\xb6\xe7\x85\xa7\xe7\x94\x9f\xe6\x88\x90\xe5\xae\x8c\xe6\x88\x90", "success");\n    } catch (e) {\n      setStatus("\xe5\xa4\x84\xe7\x90\x86\xe5\xa4\xb1\xe8\xb4\xa5: " + e.message);\n    } finally {\n      setProcessing(dom.btnIdPhoto, false);\n    }\n  }\n\n  function downloadResult() {\n    if (!state.resultId) return;\n    const a = document.createElement("a");\n    a.href = "/api/download/" + state.resultId;\n    a.download = "";\n    document.body.appendChild(a);\n    a.click();\n    document.body.removeChild(a);\n  }\n\n  // --- Load presets ---\n  async function loadPresets() {\n    try {\n      const [resizeData, idPhotoData, formatsData, modelsData] = await Promise.all([\n        api("/api/presets/resize"),\n        api("/api/presets/id-photo"),\n        api("/api/presets/formats"),\n        api("/api/presets/models"),\n      ]);\n      state.resizePresets = resizeData;\n      state.idPhotoPresets = idPhotoData;\n      state.formats = formatsData;\n      state.models = modelsData.models;\n      state.defaultModel = modelsData.default;\n\n      // Populate resize preset dropdown\n      dom.resizePreset.innerHTML = \'<option value="">\xe8\x87\xaa\xe5\xae\x9a\xe4\xb9\x89...</option>\';\n      Object.entries(resizeData).forEach(([key, val]) => {\n        const opt = document.createElement("option");\n        opt.value = key;\n        opt.textContent = val.label + " (" + val.width + "\xc3\x97" + val.height + ")";\n        dom.resizePreset.appendChild(opt);\n      });\n\n      // Populate ID photo size dropdown\n      dom.idPhotoSize.innerHTML = "";\n      Object.entries(idPhotoData).forEach(([key, val]) => {\n        const opt = document.createElement("option");\n        opt.value = key;\n        opt.textContent = val.label + " (" + val.width + "\xc3\x97" + val.height + "px)";\n        dom.idPhotoSize.appendChild(opt);\n      });\n\n      // Populate model selectors (white-bg and id-photo)\n      [dom.whiteBgModel, dom.idPhotoModel].forEach(sel => {\n        sel.innerHTML = "";\n        Object.entries(state.models).forEach(([key, label]) => {\n          const opt = document.createElement("option");\n          opt.value = key;\n          opt.textContent = label;\n          if (key === state.defaultModel) opt.selected = true;\n          sel.appendChild(opt);\n        });\n      });\n    } catch (e) {\n      console.error("Failed to load presets:", e);\n    }\n  }\n\n  // --- Event bindings ---\n\n  // File selection\n  dom.fileInput.addEventListener("change", () => {\n    const file = dom.fileInput.files[0];\n    if (file) uploadFile(file);\n    dom.fileInput.value = "";\n  });\n\n  $("#btn-select-file").addEventListener("click", () => dom.fileInput.click());\n  $("#btn-new-file").addEventListener("click", () => dom.fileInput.click());\n\n  // Drag and drop\n  dom.dropZone.addEventListener("dragover", (e) => {\n    e.preventDefault();\n    dom.dropZone.classList.add("drag-over");\n  });\n  dom.dropZone.addEventListener("dragleave", () => {\n    dom.dropZone.classList.remove("drag-over");\n  });\n  dom.dropZone.addEventListener("drop", (e) => {\n    e.preventDefault();\n    dom.dropZone.classList.remove("drag-over");\n    const file = e.dataTransfer.files[0];\n    if (file) uploadFile(file);\n  });\n\n  // Global drag and drop (anywhere in the window)\n  document.addEventListener("dragover", (e) => { e.preventDefault(); });\n  document.addEventListener("drop", (e) => {\n    e.preventDefault();\n    const file = e.dataTransfer.files[0];\n    if (file && file.type.startsWith("image/")) {\n      uploadFile(file);\n    }\n  });\n\n  // Sidebar tabs\n  $$(".sidebar-tab").forEach(btn => {\n    btn.addEventListener("click", () => {\n      state.activeTab = btn.dataset.tab;\n      $$(".sidebar-tab").forEach(b => b.classList.toggle("active", b === btn));\n      $$(".sidebar-panel").forEach(p => p.classList.toggle("active", p.id === "panel-" + btn.dataset.tab));\n    });\n  });\n\n  // Resize controls\n  dom.resizePreset.addEventListener("change", () => {\n    const key = dom.resizePreset.value;\n    if (key && state.resizePresets[key]) {\n      const preset = state.resizePresets[key];\n      dom.resizeWidth.value = preset.width;\n      dom.resizeHeight.value = preset.height;\n      state.resizeWidth = preset.width;\n      state.resizeHeight = preset.height;\n      dom.resizePercentage.value = 100;\n      dom.resizePercentageLabel.textContent = "100%";\n    }\n  });\n\n  dom.resizeWidth.addEventListener("input", () => {\n    dom.resizePreset.value = "";\n    state.resizeWidth = parseInt(dom.resizeWidth.value) || null;\n  });\n  dom.resizeHeight.addEventListener("input", () => {\n    dom.resizePreset.value = "";\n    state.resizeHeight = parseInt(dom.resizeHeight.value) || null;\n  });\n  dom.resizeKeepAspect.addEventListener("change", () => {\n    state.resizeKeepAspect = dom.resizeKeepAspect.checked;\n  });\n  dom.resizePercentage.addEventListener("input", () => {\n    dom.resizePercentageLabel.textContent = dom.resizePercentage.value + "%";\n    if (dom.resizePercentage.value !== "100") {\n      dom.resizePreset.value = "";\n    }\n  });\n  dom.btnResize.addEventListener("click", doResize);\n\n  // Convert controls\n  dom.formatOptions.querySelectorAll(".format-option").forEach(opt => {\n    opt.addEventListener("click", () => {\n      dom.formatOptions.querySelectorAll(".format-option").forEach(o => o.classList.remove("selected"));\n      opt.classList.add("selected");\n      state.convertFormat = opt.dataset.format;\n      // Show/hide quality slider for lossless formats\n      const isLossless = opt.dataset.format === "PNG" || opt.dataset.format === "BMP";\n      dom.qualityGroup.style.display = isLossless ? "none" : "";\n    });\n  });\n  dom.convertQuality.addEventListener("input", () => {\n    dom.convertQualityLabel.textContent = dom.convertQuality.value + "%";\n    state.convertQuality = parseInt(dom.convertQuality.value);\n  });\n  dom.btnConvert.addEventListener("click", doConvert);\n\n  // White BG\n  dom.btnWhiteBg.addEventListener("click", doWhiteBg);\n\n  // ID Photo controls\n  dom.idPhotoSize.addEventListener("change", () => {\n    state.idPhotoSize = dom.idPhotoSize.value;\n  });\n\n  // BG color options\n  $$(".bg-color-option").forEach(opt => {\n    opt.addEventListener("click", () => {\n      $$(".bg-color-option").forEach(o => o.classList.remove("selected"));\n      opt.classList.add("selected");\n      state.idPhotoBgColor = opt.dataset.color;\n    });\n  });\n\n  dom.btnIdPhoto.addEventListener("click", doIdPhoto);\n\n  // ID photo panel toggle\n  $("#id-photo-header").addEventListener("click", () => {\n    dom.idPhotoPanel.classList.toggle("collapsed");\n  });\n\n  // Download button\n  dom.btnDownload.addEventListener("click", downloadResult);\n\n  // Keyboard shortcut: Ctrl+S to download\n  document.addEventListener("keydown", (e) => {\n    if ((e.ctrlKey || e.metaKey) && e.key === "s") {\n      e.preventDefault();\n      if (state.resultId) downloadResult();\n    }\n  });\n\n  // --- Init ---\n  loadPresets();\n  setStatus("\xe5\xb0\xb1\xe7\xbb\xaa \xe2\x80\x94 \xe8\xaf\xb7\xe4\xb8\x8a\xe4\xbc\xa0\xe5\x9b\xbe\xe7\x89\x87\xe5\xbc\x80\xe5\xa7\x8b\xe4\xbd\xbf\xe7\x94\xa8");\n})();\n'),
+        "style.css": ("text/css; charset=utf-8", b'/* === Reset & Variables === */\n*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }\n\n:root {\n  --bg: #f5f5f5;\n  --bg-panel: #ffffff;\n  --bg-toolbar: #2c2c2c;\n  --bg-status: #2c2c2c;\n  --text: #333;\n  --text-secondary: #666;\n  --text-invert: #eee;\n  --border: #ddd;\n  --accent: #2563eb;\n  --accent-hover: #1d4ed8;\n  --accent-light: rgba(37, 99, 235, 0.08);\n  --danger: #dc2626;\n  --success: #16a34a;\n  --shadow: 0 1px 4px rgba(0,0,0,0.1);\n  --shadow-lg: 0 4px 16px rgba(0,0,0,0.12);\n  --radius: 8px;\n  --radius-sm: 4px;\n}\n\n@media (prefers-color-scheme: dark) {\n  :root {\n    --bg: #1a1a2e;\n    --bg-panel: #222244;\n    --bg-toolbar: #111122;\n    --bg-status: #111122;\n    --text: #ddd;\n    --text-secondary: #999;\n    --text-invert: #eee;\n    --border: #333366;\n    --accent: #4f8cff;\n    --accent-hover: #6aa0ff;\n    --accent-light: rgba(79, 140, 255, 0.1);\n    --shadow: 0 1px 4px rgba(0,0,0,0.3);\n    --shadow-lg: 0 4px 16px rgba(0,0,0,0.4);\n  }\n}\n\nhtml, body {\n  height: 100%;\n  font-family: -apple-system, "Segoe UI", "Noto Sans SC", sans-serif;\n  background: var(--bg);\n  color: var(--text);\n}\n\nbody {\n  display: grid;\n  grid-template-rows: 44px 1fr 28px;\n  grid-template-columns: 300px 1fr;\n  overflow: hidden;\n}\n\n/* === Toolbar === */\n#toolbar {\n  grid-column: 1 / -1;\n  background: var(--bg-toolbar);\n  color: var(--text-invert);\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  padding: 0 16px;\n  font-size: 14px;\n  z-index: 100;\n}\n#toolbar-title { font-weight: 600; font-size: 15px; }\n\n/* === Sidebar === */\n#sidebar {\n  background: var(--bg-panel);\n  border-right: 1px solid var(--border);\n  display: flex;\n  flex-direction: column;\n  overflow: hidden;\n  z-index: 50;\n}\n\n#sidebar-tabs { display: flex; border-bottom: 1px solid var(--border); flex-shrink: 0; }\n.sidebar-tab {\n  flex: 1;\n  padding: 10px 8px;\n  border: none;\n  background: transparent;\n  color: var(--text-secondary);\n  cursor: pointer;\n  font-size: 12px;\n  border-bottom: 2px solid transparent;\n  transition: all .15s;\n  white-space: nowrap;\n}\n.sidebar-tab.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }\n.sidebar-tab:hover { background: rgba(0,0,0,0.03); }\n\n.sidebar-panel { display: none; flex: 1; overflow-y: auto; }\n.sidebar-panel.active { display: flex; flex-direction: column; }\n\n.panel-content { padding: 12px; display: flex; flex-direction: column; gap: 14px; }\n\n.field-group { display: flex; flex-direction: column; gap: 6px; }\n.field-group label { font-size: 13px; font-weight: 500; color: var(--text); }\n.field-group input[type="number"],\n.field-group select {\n  padding: 8px 10px;\n  border: 1px solid var(--border);\n  border-radius: var(--radius-sm);\n  font-size: 13px;\n  background: var(--bg);\n  color: var(--text);\n  outline: none;\n  width: 100%;\n}\n.field-group input[type="number"]:focus,\n.field-group select:focus {\n  border-color: var(--accent);\n}\n.field-group input[type="checkbox"] {\n  width: 16px; height: 16px;\n  accent-color: var(--accent);\n}\n.field-group input[type="range"] { accent-color: var(--accent); }\n\n/* Buttons */\n.btn-primary {\n  padding: 10px 16px;\n  background: var(--accent);\n  color: #fff;\n  border: none;\n  border-radius: var(--radius-sm);\n  font-size: 14px;\n  font-weight: 500;\n  cursor: pointer;\n  transition: background .15s;\n  width: 100%;\n}\n.btn-primary:hover { background: var(--accent-hover); }\n.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }\n\n.btn-outline {\n  padding: 10px 20px;\n  background: transparent;\n  color: var(--accent);\n  border: 2px dashed var(--border);\n  border-radius: var(--radius);\n  font-size: 14px;\n  cursor: pointer;\n  transition: all .15s;\n}\n.btn-outline:hover { border-color: var(--accent); background: var(--accent-light); }\n\n/* Format options */\n.format-options { display: flex; flex-direction: column; gap: 6px; }\n.format-option {\n  display: flex;\n  align-items: center;\n  gap: 10px;\n  padding: 9px 12px;\n  border: 1px solid var(--border);\n  border-radius: var(--radius-sm);\n  cursor: pointer;\n  transition: all .15s;\n}\n.format-option:hover { border-color: var(--accent); background: var(--accent-light); }\n.format-option.selected { border-color: var(--accent); background: var(--accent-light); }\n.format-option .format-icon { font-size: 20px; }\n.format-option .format-name { font-weight: 600; font-size: 13px; }\n.format-option .format-desc { font-size: 11px; color: var(--text-secondary); flex: 1; text-align: right; }\n\n/* BG color options */\n.bg-color-options { display: flex; gap: 8px; }\n.bg-color-option {\n  display: flex;\n  align-items: center;\n  gap: 6px;\n  padding: 6px 12px;\n  border: 1px solid var(--border);\n  border-radius: var(--radius-sm);\n  cursor: pointer;\n  font-size: 13px;\n  transition: all .15s;\n}\n.bg-color-option:hover { border-color: var(--accent); }\n.bg-color-option.selected { border-color: var(--accent); background: var(--accent-light); }\n.color-swatch {\n  display: inline-block;\n  width: 18px;\n  height: 18px;\n  border-radius: 50%;\n}\n\n/* Info callout */\n.info-callout {\n  padding: 12px;\n  background: var(--accent-light);\n  border: 1px solid var(--accent);\n  border-radius: var(--radius-sm);\n  font-size: 13px;\n  line-height: 1.5;\n  color: var(--text);\n}\n\n/* === Main Area === */\n#main-area {\n  background: var(--bg);\n  overflow: auto;\n  display: flex;\n  flex-direction: column;\n  position: relative;\n}\n\n/* Drop zone */\n#drop-zone {\n  flex: 1;\n  display: flex;\n  align-items: center;\n  justify-content: center;\n  margin: 20px;\n  border: 2px dashed var(--border);\n  border-radius: var(--radius);\n  transition: all .2s;\n}\n#drop-zone.drag-over { border-color: var(--accent); background: var(--accent-light); }\n.drop-zone-content { text-align: center; padding: 40px; }\n.drop-icon { font-size: 64px; margin-bottom: 16px; }\n.drop-text { font-size: 18px; font-weight: 500; margin-bottom: 8px; }\n.drop-hint { font-size: 13px; color: var(--text-secondary); margin-bottom: 20px; }\n\n/* Preview area */\n#preview-area { flex: 1; display: flex; flex-direction: column; overflow: hidden; }\n#preview-toolbar {\n  display: flex;\n  align-items: center;\n  gap: 16px;\n  padding: 10px 20px;\n  background: var(--bg-panel);\n  border-bottom: 1px solid var(--border);\n  flex-shrink: 0;\n}\n#preview-toolbar button {\n  padding: 6px 14px;\n  background: var(--bg);\n  border: 1px solid var(--border);\n  border-radius: var(--radius-sm);\n  font-size: 13px;\n  cursor: pointer;\n  color: var(--text);\n}\n#preview-toolbar button:hover { background: var(--border); }\n#preview-info {\n  display: flex;\n  gap: 16px;\n  font-size: 12px;\n  color: var(--text-secondary);\n  flex: 1;\n}\n#preview-info span { white-space: nowrap; }\n\n#preview-container {\n  flex: 1;\n  display: flex;\n  gap: 20px;\n  padding: 20px;\n  overflow: auto;\n  align-items: flex-start;\n  justify-content: center;\n}\n\n#preview-original, #preview-result {\n  flex: 1;\n  max-width: 48%;\n  display: flex;\n  flex-direction: column;\n  align-items: center;\n  background: var(--bg-panel);\n  border: 1px solid var(--border);\n  border-radius: var(--radius);\n  padding: 16px;\n  box-shadow: var(--shadow);\n}\n\n#preview-arrow {\n  font-size: 28px;\n  align-self: center;\n  flex-shrink: 0;\n  color: var(--text-secondary);\n}\n\n.preview-label {\n  font-size: 13px;\n  font-weight: 600;\n  color: var(--text-secondary);\n  margin-bottom: 10px;\n  text-transform: uppercase;\n  letter-spacing: 0.5px;\n}\n\n.preview-img-wrap {\n  width: 100%;\n  text-align: center;\n  background: repeating-conic-gradient(#f0f0f0 0% 25%, transparent 0% 50%) 50% / 16px 16px;\n  border-radius: var(--radius-sm);\n  overflow: hidden;\n  min-height: 100px;\n  display: flex;\n  align-items: center;\n  justify-content: center;\n}\n\n.preview-img-wrap img {\n  max-width: 100%;\n  max-height: 50vh;\n  object-fit: contain;\n  display: block;\n}\n\n.img-info {\n  font-size: 11px;\n  color: var(--text-secondary);\n  margin-top: 8px;\n  text-align: center;\n}\n\n#result-actions { margin-top: 12px; }\n#result-actions .btn-primary { padding: 8px 24px; width: auto; }\n\n/* === ID Photo Panel === */\n#id-photo-panel {\n  position: fixed;\n  bottom: 36px;\n  right: 16px;\n  width: 260px;\n  background: var(--bg-panel);\n  border: 1px solid var(--border);\n  border-radius: var(--radius);\n  box-shadow: var(--shadow-lg);\n  z-index: 200;\n  overflow: hidden;\n}\n#id-photo-header {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  padding: 10px 12px;\n  background: var(--accent);\n  color: #fff;\n  font-size: 13px;\n  font-weight: 600;\n  cursor: pointer;\n}\n#id-photo-header button {\n  background: transparent;\n  border: none;\n  color: #fff;\n  cursor: pointer;\n  font-size: 12px;\n  transition: transform .2s;\n}\n#id-photo-panel.collapsed #id-photo-header button { transform: rotate(-90deg); }\n#id-photo-body {\n  padding: 12px;\n  display: flex;\n  flex-direction: column;\n  gap: 12px;\n}\n#id-photo-panel.collapsed #id-photo-body { display: none; }\n\n/* === Status bar === */\n#status-bar {\n  grid-column: 1 / -1;\n  background: var(--bg-status);\n  color: var(--text-invert);\n  display: flex;\n  align-items: center;\n  padding: 0 16px;\n  font-size: 12px;\n  z-index: 100;\n}\n#status-bar span { opacity: 0.8; }\n\n/* === Scrollbar === */\n::-webkit-scrollbar { width: 6px; }\n::-webkit-scrollbar-track { background: transparent; }\n::-webkit-scrollbar-thumb { background: rgba(128,128,128,0.4); border-radius: 3px; }\n::-webkit-scrollbar-thumb:hover { background: rgba(128,128,128,0.6); }\n\n/* === Loading state === */\n.loading {\n  opacity: 0.6;\n  pointer-events: none;\n}\n\n/* === Toast notification === */\n.toast {\n  position: fixed;\n  top: 56px;\n  left: 50%;\n  transform: translateX(-50%);\n  background: var(--bg-toolbar);\n  color: var(--text-invert);\n  padding: 10px 24px;\n  border-radius: var(--radius);\n  font-size: 14px;\n  z-index: 999;\n  box-shadow: var(--shadow-lg);\n  animation: toast-in .3s ease-out;\n}\n.toast.error { border-left: 4px solid var(--danger); }\n.toast.success { border-left: 4px solid var(--success); }\n@keyframes toast-in {\n  from { opacity: 0; transform: translateX(-50%) translateY(-10px); }\n  to { opacity: 1; transform: translateX(-50%) translateY(0); }\n}\n'),
+    }
+    # If static/ directory exists, prefer disk versions (for development)
+    if APP_DIR.is_dir():
+        for filename, ct in [
+            ("index.html", "text/html; charset=utf-8"),
+            ("app.js", "application/javascript; charset=utf-8"),
+            ("style.css", "text/css; charset=utf-8"),
+        ]:
+            path = APP_DIR / filename
+            if path.exists():
+                _STATIC[filename] = (ct, path.read_bytes())
+
+
+# ── Flask app ──────────────────────────────────────────────────────────────
+
+app = Flask(__name__)
+
+CONFIG = {
+    "uploads": {},
+}
+UPLOAD_DIR = os.path.join(tempfile.gettempdir(), "img_tool_uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+RESULTS = {}
+
+
+# -- Static file serving (from memory, fallback to disk) --
+
+@app.route("/")
+def index():
+    return _serve_static_file("index.html")
+
+
+@app.route("/<path:filename>")
+def serve_static(filename):
+    if filename in _STATIC:
+        return _serve_static_file(filename)
+    # Fallback: try disk
+    path = (APP_DIR / filename).resolve()
+    try:
+        path.relative_to(APP_DIR.resolve())
+    except ValueError:
+        abort(403)
+    if path.exists() and path.is_file():
+        return send_file(str(path))
+    abort(404)
+
+
+def _serve_static_file(name):
+    ct, data = _STATIC.get(name, ("text/plain", b""))
+    return Response(data, content_type=ct)
+
+
+# -- Helpers --
+
+def _save_upload(file_storage) -> dict:
+    if not file_storage or not file_storage.filename:
+        abort(400, description="No file provided")
+    ext = os.path.splitext(file_storage.filename)[1].lower()
+    allowed = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tiff", ".tif"}
+    if ext not in allowed:
+        abort(400, description=f"Unsupported file type: {ext}")
+    safe_name = f"{uuid.uuid4().hex}{ext}"
+    dest = os.path.join(UPLOAD_DIR, safe_name)
+    file_storage.save(dest)
+    try:
+        with open(dest, "rb") as f:
+            data = f.read()
+        info = get_image_info(data)
+    except Exception:
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+        abort(422, description="File is not a valid image")
+    upload_id = f"upload_{uuid.uuid4().hex[:12]}"
+    CONFIG["uploads"][upload_id] = {"path": dest, "name": file_storage.filename, "info": info}
+    return {"id": upload_id, "name": file_storage.filename, "info": info}
+
+
+def _get_upload_data(upload_id: str) -> bytes:
+    entry = CONFIG["uploads"].get(upload_id)
+    if not entry:
+        abort(404, description="Upload not found")
+    with open(entry["path"], "rb") as f:
+        return f.read()
+
+
+# -- API routes --
+
+@app.route("/api/upload", methods=["POST"])
+def api_upload():
+    if "file" not in request.files:
+        abort(400, description="No file provided")
+    return jsonify(_save_upload(request.files["file"]))
+
+
+@app.route("/api/info/<upload_id>")
+def api_info(upload_id):
+    data = _get_upload_data(upload_id)
+    return jsonify(get_image_info(data))
+
+
+@app.route("/api/preview/<upload_id>")
+def api_preview(upload_id):
+    data = _get_upload_data(upload_id)
+    img = load_image(data)
+    preview = image_to_bytes(img, "JPEG", 85)
+    return send_file(io.BytesIO(preview), mimetype="image/jpeg")
+
+
+@app.route("/api/resize", methods=["POST"])
+def api_resize():
+    body = request.get_json(silent=True) or {}
+    upload_id = body.get("upload_id")
+    if not upload_id:
+        abort(400, description="No upload_id provided")
+    data = _get_upload_data(upload_id)
+    width = body.get("width")
+    height = body.get("height")
+    keep_aspect = body.get("keep_aspect", True)
+    percentage = body.get("percentage")
+    try:
+        result_bytes, mime, new_w, new_h = process_resize(
+            data, width=width, height=height, keep_aspect=keep_aspect, percentage=percentage)
+    except Exception as e:
+        abort(500, description=str(e))
+    result_id = uuid.uuid4().hex[:12]
+    ext = "png" if "png" in mime else "jpg"
+    RESULTS[result_id] = (result_bytes, mime, f"resized_{new_w}x{new_h}.{ext}")
+    return jsonify({"result_id": result_id, "width": new_w, "height": new_h, "size": len(result_bytes), "mime": mime})
+
+
+@app.route("/api/convert", methods=["POST"])
+def api_convert():
+    body = request.get_json(silent=True) or {}
+    upload_id = body.get("upload_id")
+    if not upload_id:
+        abort(400, description="No upload_id provided")
+    target_format = body.get("format", "PNG")
+    fmt_lower = target_format.lower()
+    fmt_key = None
+    for key in OUTPUT_FORMATS:
+        if key.lower() == fmt_lower:
+            fmt_key = key
+            break
+    if not fmt_key:
+        abort(400, description=f"Unsupported format: {target_format}")
+    quality = body.get("quality", 90)
+    data = _get_upload_data(upload_id)
+    try:
+        result_bytes, mime, w, h = process_convert(data, fmt_key, quality)
+    except Exception as e:
+        abort(500, description=str(e))
+    result_id = uuid.uuid4().hex[:12]
+    ext = OUTPUT_FORMATS[fmt_key]["ext"]
+    entry = CONFIG["uploads"][upload_id]
+    base_name = os.path.splitext(entry["name"])[0]
+    RESULTS[result_id] = (result_bytes, mime, f"{base_name}.{ext}")
+    return jsonify({"result_id": result_id, "width": w, "height": h, "size": len(result_bytes), "mime": mime, "format": fmt_key})
+
+
+@app.route("/api/white-bg", methods=["POST"])
+def api_white_bg():
+    body = request.get_json(silent=True) or {}
+    upload_id = body.get("upload_id")
+    if not upload_id:
+        abort(400, description="No upload_id provided")
+    model_name = body.get("model") or None
+    data = _get_upload_data(upload_id)
+    try:
+        result_bytes, mime, w, h = process_white_bg(data, model_name=model_name)
+    except Exception as e:
+        abort(500, description=str(e))
+    result_id = uuid.uuid4().hex[:12]
+    entry = CONFIG["uploads"][upload_id]
+    base_name = os.path.splitext(entry["name"])[0]
+    RESULTS[result_id] = (result_bytes, mime, f"{base_name}_白底.jpg")
+    return jsonify({"result_id": result_id, "width": w, "height": h, "size": len(result_bytes), "mime": mime})
+
+
+@app.route("/api/id-photo", methods=["POST"])
+def api_id_photo():
+    body = request.get_json(silent=True) or {}
+    upload_id = body.get("upload_id")
+    if not upload_id:
+        abort(400, description="No upload_id provided")
+    size_key = body.get("size", "1inch")
+    bg_color = body.get("bg_color", "white")
+    model_name = body.get("model") or None
+    if size_key not in ID_PHOTO_SIZES:
+        abort(400, description=f"Unknown ID photo size: {size_key}")
+    data = _get_upload_data(upload_id)
+    try:
+        result_bytes, mime, w, h, label = process_id_photo(data, size_key, bg_color, model_name=model_name)
+    except Exception as e:
+        abort(500, description=str(e))
+    result_id = uuid.uuid4().hex[:12]
+    entry = CONFIG["uploads"][upload_id]
+    base_name = os.path.splitext(entry["name"])[0]
+    RESULTS[result_id] = (result_bytes, mime, f"{base_name}_{label}.jpg")
+    return jsonify({"result_id": result_id, "width": w, "height": h, "size": len(result_bytes), "mime": mime, "label": label, "size_key": size_key})
+
+
+@app.route("/api/download/<result_id>")
+def api_download(result_id):
+    entry = RESULTS.get(result_id)
+    if not entry:
+        abort(404, description="Result not found")
+    data, mime, filename = entry
+    return send_file(io.BytesIO(data), mimetype=mime, as_attachment=True, download_name=filename)
+
+
+@app.route("/api/result/<result_id>")
+def api_result_preview(result_id):
+    entry = RESULTS.get(result_id)
+    if not entry:
+        abort(404, description="Result not found")
+    data, mime, filename = entry
+    return send_file(io.BytesIO(data), mimetype=mime)
+
+
+@app.route("/api/presets/models")
+def api_presets_models():
+    return jsonify({"models": AVAILABLE_MODELS, "default": DEFAULT_MODEL})
+
+
+@app.route("/api/presets/id-photo")
+def api_presets_id_photo():
+    return jsonify({key: {"width": w, "height": h, "label": label} for key, (w, h, label) in ID_PHOTO_SIZES.items()})
+
+
+@app.route("/api/presets/resize")
+def api_presets_resize():
+    return jsonify({key: {"width": w, "height": h, "label": label} for key, (w, h, label) in RESIZE_PRESETS.items()})
+
+
+@app.route("/api/presets/formats")
+def api_presets_formats():
+    return jsonify({key: {"ext": v["ext"], "mime": v["mime"], "lossless": v["lossless"]} for key, v in OUTPUT_FORMATS.items()})
+
+
+# -- Error handlers --
+
+@app.errorhandler(404)
+def _404(e):
+    return jsonify({"error": "not found", "detail": str(e)}), 404
+
+
+@app.errorhandler(422)
+def _422(e):
+    return jsonify({"error": "unprocessable", "detail": str(e)}), 422
+
+
+@app.errorhandler(500)
+def _500(e):
+    return jsonify({"error": "server error", "detail": str(e)}), 500
+
+
+# -- Entry point --
+
+def main():
+    parser = argparse.ArgumentParser(description="在线图片工具 — resize / convert / ID photo")
+    parser.add_argument("--port", type=int, default=8613, help="端口 (默认: 8613)")
+    parser.add_argument("--host", default="127.0.0.1", help="绑定地址 (默认: 127.0.0.1)")
+    parser.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
+    args = parser.parse_args()
+
+    _load_static()
+
+    url = f"http://{args.host}:{args.port}"
+    print(f"🖼️  在线图片工具已启动: {url}")
+    print(f"功能: 调整尺寸 | 格式转换 | 白底照片 | 证件照制作")
+
+    if not args.no_browser:
+        webbrowser.open(url)
+
+    app.run(host=args.host, port=args.port, debug=False)
+
+
+if __name__ == "__main__":
+    main()
