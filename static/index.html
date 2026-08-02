@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🖼️ 在线图片工具</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<!-- Toolbar -->
+<div id="toolbar">
+  <span id="toolbar-title">🖼️ 在线图片工具</span>
+  <div id="toolbar-actions">
+    <span id="file-name-display" style="opacity:0.7;font-size:13px;">未选择图片</span>
+  </div>
+</div>
+
+<!-- Sidebar -->
+<div id="sidebar">
+  <div id="sidebar-tabs">
+    <button class="sidebar-tab active" data-tab="resize">📐 调整尺寸</button>
+    <button class="sidebar-tab" data-tab="convert">🔄 格式转换</button>
+    <button class="sidebar-tab" data-tab="white-bg">⬜ 白底照片</button>
+  </div>
+
+  <!-- Resize Panel -->
+  <div id="panel-resize" class="sidebar-panel active">
+    <div class="panel-content">
+      <div class="field-group">
+        <label>预设尺寸</label>
+        <select id="resize-preset">
+          <option value="">自定义...</option>
+        </select>
+      </div>
+
+      <div class="field-group">
+        <label>宽度 (像素)</label>
+        <input type="number" id="resize-width" min="1" max="8000" placeholder="自动">
+      </div>
+
+      <div class="field-group">
+        <label>高度 (像素)</label>
+        <input type="number" id="resize-height" min="1" max="8000" placeholder="自动">
+      </div>
+
+      <div class="field-group">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+          <input type="checkbox" id="resize-keep-aspect" checked>
+          保持宽高比
+        </label>
+      </div>
+
+      <div class="field-group">
+        <label>按百分比缩放</label>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <input type="range" id="resize-percentage" min="10" max="500" value="100" style="flex:1;">
+          <span id="resize-percentage-label" style="min-width:45px;text-align:right;">100%</span>
+        </div>
+      </div>
+
+      <button class="btn-primary" id="btn-resize">📐 调整尺寸</button>
+    </div>
+  </div>
+
+  <!-- Convert Panel -->
+  <div id="panel-convert" class="sidebar-panel">
+    <div class="panel-content">
+      <div class="field-group">
+        <label>目标格式</label>
+        <div class="format-options" id="format-options">
+          <label class="format-option selected" data-format="JPEG">
+            <span class="format-icon">🖼️</span>
+            <span class="format-name">JPEG</span>
+            <span class="format-desc">有损压缩·体积小</span>
+          </label>
+          <label class="format-option" data-format="PNG">
+            <span class="format-icon">🖼️</span>
+            <span class="format-name">PNG</span>
+            <span class="format-desc">无损·支持透明</span>
+          </label>
+          <label class="format-option" data-format="WebP">
+            <span class="format-icon">🖼️</span>
+            <span class="format-name">WebP</span>
+            <span class="format-desc">现代格式·体积小</span>
+          </label>
+          <label class="format-option" data-format="BMP">
+            <span class="format-icon">🖼️</span>
+            <span class="format-name">BMP</span>
+            <span class="format-desc">位图·无压缩</span>
+          </label>
+        </div>
+      </div>
+
+      <div class="field-group" id="quality-group">
+        <label>质量</label>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <input type="range" id="convert-quality" min="10" max="100" value="90" style="flex:1;">
+          <span id="convert-quality-label" style="min-width:40px;text-align:right;">90%</span>
+        </div>
+      </div>
+
+      <button class="btn-primary" id="btn-convert">🔄 转换格式</button>
+    </div>
+  </div>
+
+  <!-- White BG Panel -->
+  <div id="panel-white-bg" class="sidebar-panel">
+    <div class="panel-content">
+      <div class="info-callout">
+        💡 将图片的透明背景转换为白色背景。使用 AI 自动识别并移除背景，生成白底 JPEG。
+      </div>
+      <div class="field-group">
+        <label>AI 抠图模型</label>
+        <select id="white-bg-model">
+        </select>
+      </div>
+      <button class="btn-primary" id="btn-white-bg">⬜ 生成白底照片</button>
+    </div>
+  </div>
+</div>
+
+<!-- Main area -->
+<div id="main-area">
+  <!-- Drop zone / empty state -->
+  <div id="drop-zone">
+    <div class="drop-zone-content">
+      <div class="drop-icon">📷</div>
+      <div class="drop-text">拖拽图片到此处，或点击选择文件</div>
+      <div class="drop-hint">支持 JPG、PNG、WebP、BMP、GIF、TIFF</div>
+      <input type="file" id="file-input" accept=".png,.jpg,.jpeg,.webp,.bmp,.gif,.tiff,.tif" style="display:none">
+      <button class="btn-outline" id="btn-select-file">📂 选择图片</button>
+    </div>
+  </div>
+
+  <!-- Preview area -->
+  <div id="preview-area" style="display:none;">
+    <div id="preview-toolbar">
+      <button id="btn-new-file">📂 新图片</button>
+      <div id="preview-info">
+        <span id="preview-filename"></span>
+        <span id="preview-dimensions"></span>
+        <span id="preview-size"></span>
+      </div>
+    </div>
+    <div id="preview-container">
+      <div id="preview-original">
+        <div class="preview-label">原图</div>
+        <div class="preview-img-wrap">
+          <img id="img-original" src="" alt="原始图片">
+        </div>
+        <div id="original-info" class="img-info"></div>
+      </div>
+      <div id="preview-arrow">➡️</div>
+      <div id="preview-result">
+        <div class="preview-label">处理结果</div>
+        <div class="preview-img-wrap">
+          <img id="img-result" src="" alt="处理结果">
+        </div>
+        <div id="result-info" class="img-info"></div>
+        <div id="result-actions" style="display:none;">
+          <button class="btn-primary" id="btn-download">💾 下载</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ID Photo panel (fixed bottom-right) -->
+<div id="id-photo-panel">
+  <div id="id-photo-header">
+    <span>📸 证件照制作</span>
+    <button id="id-photo-toggle" title="展开/收起">▼</button>
+  </div>
+  <div id="id-photo-body">
+    <div class="field-group">
+      <label>证件照尺寸</label>
+      <select id="id-photo-size">
+      </select>
+    </div>
+    <div class="field-group">
+      <label>背景颜色</label>
+      <div class="bg-color-options">
+        <label class="bg-color-option selected" data-color="white">
+          <span class="color-swatch" style="background:#fff;border:2px solid #ccc;"></span> 白色
+        </label>
+        <label class="bg-color-option" data-color="red">
+          <span class="color-swatch" style="background:#c8161e;"></span> 红色
+        </label>
+        <label class="bg-color-option" data-color="blue">
+          <span class="color-swatch" style="background:#3c78d2;"></span> 蓝色
+        </label>
+      </div>
+    </div>
+    <div class="field-group">
+      <label>AI 抠图模型</label>
+      <select id="id-photo-model">
+      </select>
+    </div>
+    <button class="btn-primary" id="btn-id-photo">📸 生成证件照</button>
+  </div>
+</div>
+
+<!-- Status bar -->
+<div id="status-bar">
+  <span id="status-text">就绪 — 请先上传图片</span>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
