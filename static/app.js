@@ -420,11 +420,18 @@
       state.resizeHeight = preset.height;
       dom.resizePercentage.value = 100;
       dom.resizePercentageLabel.textContent = "100%";
+      // Preset and keep-aspect are mutually exclusive
+      dom.resizeKeepAspect.checked = false;
+      state.resizeKeepAspect = false;
+      dom.resizeKeepAspect.disabled = true;
+    } else {
+      dom.resizeKeepAspect.disabled = false;
     }
   });
 
   dom.resizeWidth.addEventListener("input", () => {
     dom.resizePreset.value = "";
+    dom.resizeKeepAspect.disabled = false;
     state.resizeWidth = parseInt(dom.resizeWidth.value) || null;
     // Auto-fill height when keep-aspect is checked
     if (dom.resizeKeepAspect.checked && state.originalInfo && state.resizeWidth) {
@@ -436,6 +443,7 @@
   });
   dom.resizeHeight.addEventListener("input", () => {
     dom.resizePreset.value = "";
+    dom.resizeKeepAspect.disabled = false;
     state.resizeHeight = parseInt(dom.resizeHeight.value) || null;
     // Auto-fill width when keep-aspect is checked
     if (dom.resizeKeepAspect.checked && state.originalInfo && state.resizeHeight) {
@@ -447,11 +455,15 @@
   });
   dom.resizeKeepAspect.addEventListener("change", () => {
     state.resizeKeepAspect = dom.resizeKeepAspect.checked;
+    if (state.resizeKeepAspect) {
+      dom.resizePreset.value = "";
+    }
   });
   dom.resizePercentage.addEventListener("input", () => {
     dom.resizePercentageLabel.textContent = dom.resizePercentage.value + "%";
     if (dom.resizePercentage.value !== "100") {
       dom.resizePreset.value = "";
+      dom.resizeKeepAspect.disabled = false;
     }
   });
   dom.btnResize.addEventListener("click", doResize);
