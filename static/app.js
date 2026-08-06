@@ -118,6 +118,7 @@
       }
       return res.json();
     } catch (e) {
+      if (e.name === "AbortError") throw e;
       console.error("API error:", e);
       showToast(e.message, "error");
       throw e;
@@ -164,6 +165,8 @@
   }
 
   // --- Operations ---
+  let abortController = null;
+
   async function doResize() {
     if (!state.uploadId) { showToast("请先上传图片", "error"); return; }
 
@@ -180,11 +183,17 @@
       body.keep_aspect = dom.resizeKeepAspect.checked;
     }
 
+    // Cancel previous in-flight request
+    if (abortController) abortController.abort();
+    abortController = new AbortController();
+
+    setProcessing(dom.btnResize, true);
     setStatus("正在调整尺寸...");
     try {
       const data = await api("/api/resize", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: abortController.signal,
         body: JSON.stringify(body),
       });
 
@@ -196,7 +205,11 @@
       setStatus("尺寸调整完成: " + data.width + "×" + data.height + " (" + formatBytes(data.size) + ")");
       showToast("尺寸调整完成", "success");
     } catch (e) {
-      setStatus("处理失败: " + e.message);
+      if (e.name !== "AbortError") {
+        setStatus("处理失败: " + e.message);
+      }
+    } finally {
+      setProcessing(dom.btnResize, false);
     }
   }
 

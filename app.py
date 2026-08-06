@@ -365,7 +365,7 @@ def main():
     if not args.no_browser:
         webbrowser.open(url)
 
-    app.run(host=args.host, port=args.port, debug=False)
+    app.run(host=args.host, port=args.port, debug=False, threaded=True)
 
 
 if __name__ == "__main__":
