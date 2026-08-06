@@ -426,10 +426,24 @@
   dom.resizeWidth.addEventListener("input", () => {
     dom.resizePreset.value = "";
     state.resizeWidth = parseInt(dom.resizeWidth.value) || null;
+    // Auto-fill height when keep-aspect is checked
+    if (dom.resizeKeepAspect.checked && state.originalInfo && state.resizeWidth) {
+      const ratio = state.originalInfo.height / state.originalInfo.width;
+      const h = Math.round(state.resizeWidth * ratio);
+      dom.resizeHeight.value = h;
+      state.resizeHeight = h;
+    }
   });
   dom.resizeHeight.addEventListener("input", () => {
     dom.resizePreset.value = "";
     state.resizeHeight = parseInt(dom.resizeHeight.value) || null;
+    // Auto-fill width when keep-aspect is checked
+    if (dom.resizeKeepAspect.checked && state.originalInfo && state.resizeHeight) {
+      const ratio = state.originalInfo.width / state.originalInfo.height;
+      const w = Math.round(state.resizeHeight * ratio);
+      dom.resizeWidth.value = w;
+      state.resizeWidth = w;
+    }
   });
   dom.resizeKeepAspect.addEventListener("change", () => {
     state.resizeKeepAspect = dom.resizeKeepAspect.checked;
