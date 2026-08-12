@@ -12,3 +12,4 @@ build/
 *.swo
 uploads/
 .claude/
+*CLAUDE*
