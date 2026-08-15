@@ -4,11 +4,14 @@ import io
 import os
 import sys
 import tempfile
+import time
 import uuid
 import webbrowser
+from collections import defaultdict
+from datetime import date, timedelta
 from pathlib import Path
 
-from flask import Flask, jsonify, request, send_file, abort
+from flask import Flask, jsonify, request, send_file, abort, g
 
 from image_engine import (
     load_image,
@@ -36,6 +39,55 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # Store processed results (keyed by result_id)
 RESULTS = {}  # result_id -> (bytes, mime_type, filename)
+
+# ── Visitor stats ───────────────────────────────────────────────────────
+VISITORS = defaultdict(lambda: {"ips": set(), "requests": 0, "errors": []})
+MAX_ERRORS = 50
+
+
+@app.before_request
+def _track_visit():
+    g.start_time = time.time()
+    ip = request.headers.get("X-Real-IP") or request.headers.get("X-Forwarded-For") or request.remote_addr
+    today = date.today().isoformat()
+    stats = VISITORS[today]
+    stats["ips"].add(ip.split(",")[0].strip())
+    stats["requests"] += 1
+
+
+@app.after_request
+def _log_request(response):
+    elapsed = (time.time() - g.get("start_time", 0)) * 1000
+    ip = request.headers.get("X-Real-IP") or request.headers.get("X-Forwarded-For") or request.remote_addr
+    print(f"[{time.strftime('%H:%M:%S')}] {ip.split(',')[0].strip()} "
+          f"{request.method} {request.path} → {response.status_code} ({elapsed:.0f}ms)", flush=True)
+    if response.status_code >= 500:
+        today = date.today().isoformat()
+        errs = VISITORS[today]["errors"]
+        if len(errs) < MAX_ERRORS:
+            errs.append(f"{time.strftime('%H:%M:%S')} {request.method} {request.path} → {response.status_code}")
+    return response
+
+
+@app.route("/api/stats")
+def api_stats():
+    """Return today's visitor statistics."""
+    today = date.today().isoformat()
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    stats = {
+        "today": {
+            "visitors": len(VISITORS[today]["ips"]),
+            "requests": VISITORS[today]["requests"],
+            "errors": len(VISITORS[today]["errors"]),
+            "last_errors": VISITORS[today]["errors"][-5:],
+        },
+    }
+    if yesterday in VISITORS:
+        stats["yesterday"] = {
+            "visitors": len(VISITORS[yesterday]["ips"]),
+            "requests": VISITORS[yesterday]["requests"],
+        }
+    return jsonify(stats)
 
 
 def _save_upload(file_storage) -> dict:
